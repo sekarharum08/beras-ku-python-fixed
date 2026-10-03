@@ -1,4 +1,5 @@
 from flask import Flask, request, redirect, url_for, session, render_template_string, flash
+import os
 import sqlite3
 from pathlib import Path
 from functools import wraps
@@ -6,50 +7,68 @@ from functools import wraps
 app = Flask(__name__)
 app.secret_key = "beras-ku-mvp-secret-key"
 DB = Path(__file__).with_name("beras_ku.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # =========================
 # DATABASE
 # =========================
+class HybridRow(dict):
+    """Row yang bisa diakses dengan nama kolom atau indeks seperti sqlite.Row."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+class PgCursor:
+    def __init__(self, cursor):
+        self.cursor = cursor
+        self.lastrowid = None
+    def fetchone(self):
+        row = self.cursor.fetchone()
+        return HybridRow(row) if row is not None else None
+    def fetchall(self):
+        return [HybridRow(row) for row in self.cursor.fetchall()]
+
+class PgConnection:
+    def __init__(self, conn):
+        self.conn = conn
+    def execute(self, sql, params=()):
+        cur = self.conn.cursor()
+        cur.execute(sql.replace('?', '%s'), params)
+        return PgCursor(cur)
+    def executemany(self, sql, params):
+        cur = self.conn.cursor()
+        cur.executemany(sql.replace('?', '%s'), params)
+        return cur
+    def commit(self): self.conn.commit()
+    def rollback(self): self.conn.rollback()
+    def close(self): self.conn.close()
+
 def db():
+    if DATABASE_URL:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        return PgConnection(psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor))
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        type TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        price INTEGER NOT NULL,
-        stock INTEGER NOT NULL DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_name TEXT NOT NULL,
-        phone TEXT NOT NULL,
-        address TEXT NOT NULL,
-        payment TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'Menunggu Konfirmasi',
-        total INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
-        product_name TEXT NOT NULL,
-        size INTEGER NOT NULL,
-        price INTEGER NOT NULL,
-        qty INTEGER NOT NULL,
-        FOREIGN KEY(order_id) REFERENCES orders(id)
-    );
-    """)
-
+    if DATABASE_URL:
+        statements = [
+            "CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, size INTEGER NOT NULL, price INTEGER NOT NULL, stock INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, customer_name TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL, payment TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Menunggu Konfirmasi', total INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS order_items (id SERIAL PRIMARY KEY, order_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, size INTEGER NOT NULL, price INTEGER NOT NULL, qty INTEGER NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id))"
+        ]
+        for statement in statements:
+            conn.execute(statement)
+    else:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, type TEXT NOT NULL, size INTEGER NOT NULL, price INTEGER NOT NULL, stock INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL, payment TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Menunggu Konfirmasi', total INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, product_id INTEGER NOT NULL, product_name TEXT NOT NULL, size INTEGER NOT NULL, price INTEGER NOT NULL, qty INTEGER NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id));
+        """)
     if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
         products = [
             ("Beras Premium Pulen", "Premium", 5, 72000, 40),
@@ -59,10 +78,7 @@ def init_db():
             ("Beras Pandan Wangi", "Pandan Wangi", 5, 85000, 30),
             ("Beras Pandan Wangi", "Pandan Wangi", 10, 165000, 40),
         ]
-        conn.executemany(
-            "INSERT INTO products(name,type,size,price,stock) VALUES(?,?,?,?,?)",
-            products
-        )
+        conn.executemany("INSERT INTO products(name,type,size,price,stock) VALUES(?,?,?,?,?)", products)
     conn.commit()
     conn.close()
 
@@ -334,11 +350,18 @@ def checkout():
             flash("Nama, WhatsApp, dan alamat wajib diisi.", "error")
             return redirect("/checkout")
 
-        cur = conn.execute("""
-            INSERT INTO orders(customer_name,phone,address,payment,total)
-            VALUES(?,?,?,?,?)
-        """, (name, phone, address, payment, total))
-        order_id = cur.lastrowid
+        if DATABASE_URL:
+            cur = conn.execute("""
+                INSERT INTO orders(customer_name,phone,address,payment,total)
+                VALUES(?,?,?,?,?) RETURNING id
+            """, (name, phone, address, payment, total))
+            order_id = cur.fetchone()["id"]
+        else:
+            cur = conn.execute("""
+                INSERT INTO orders(customer_name,phone,address,payment,total)
+                VALUES(?,?,?,?,?)
+            """, (name, phone, address, payment, total))
+            order_id = cur.lastrowid
 
         for p, qty in items:
             conn.execute("""
@@ -591,12 +614,17 @@ def order_status(oid):
 # =========================
 # RUN
 # =========================
-if __name__ == "__main__":
+# Vercel mengimpor modul sebagai aplikasi; inisialisasi tabel saat cold start.
+try:
     init_db()
+except Exception:
+    app.logger.exception("Gagal menginisialisasi database")
+
+if __name__ == "__main__":
     print("=" * 55)
     print("BerasKu MVP berjalan di http://127.0.0.1:5000")
     print("Admin: http://127.0.0.1:5000/admin")
     print("Username: admin")
     print("Password: admin123")
     print("=" * 55)
-    app.run(debug=True)
+    app.run(debug=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
